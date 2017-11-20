@@ -1,0 +1,1201 @@
+/*
+ * Copyright (C) 2017 Vitsch Electronics
+ *
+ * Thomas van Kleef <linux-dev@vitsch.nl>
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License as
+ * published by the Free Software Foundation; either version 2 of
+ * the License, or (at your option) any later version.
+ */
+
+// #include <linux/module.h>
+#include <linux/platform_device.h>
+#include <linux/module.h>
+#include <linux/miscdevice.h>
+#include <linux/proc_fs.h>
+#include <linux/clk.h>
+#include <linux/reset.h>
+#include <linux/regmap.h>
+#include <linux/delay.h>
+#include <uapi/drm/drm_fourcc.h>
+#include <linux/dma-mapping.h>
+#include <linux/slab.h>
+#include <linux/of.h>
+
+#include <uapi/linux/videodev2.h>
+#include <media/v4l2-device.h>
+#include <media/v4l2-mem2mem.h>
+#include <media/v4l2-ioctl.h>
+#include <media/videobuf2-dma-contig.h>
+
+#include <uapi/misc/sunxi_front_end.h>
+#include "sunxi_front_end.h"
+#include "sunxi_front_end_dma_ctrl.h"
+#include "sunxi_front_end_color_space_converter.h"
+#include "sunxi_front_end_registers.h"
+
+#define FRONT_END_MODULE_NAME	"sunxi_front_end"
+#define SUNXI_DE_FE_CAPTURE	BIT(1)
+#define SUNXI_DE_FE_OUTPUT	BIT(0)
+#define NUM_FORMATS		ARRAY_SIZE(formats)
+
+uint32_t sunxi_de_fe_debug_lvl = 0;
+char *de_fe_msg;
+
+static long sunxi_fe_ioctl(struct file *filp,
+    unsigned int cmd, unsigned long arg);
+static ssize_t proc_sunxi_de_fe_write(struct file *filp, const char *buf,
+    size_t count, loff_t *offp);
+
+static int sunxi_fe_release(struct file *file);
+static int sunxi_fe_open(struct file *file);
+
+static struct sunxi_fe_device *sunxi_fe_dev;
+static struct miscdevice fe_miscdevice = {0};
+static struct proc_dir_entry *sunxi_fe_proc_entry;
+
+static struct ctl_table sunxi_de_fe_root_table[] = {
+	{ 	.procname     = "sunxi_de_fe_debug_lvl",
+		.data         = &sunxi_de_fe_debug_lvl,
+		.maxlen       = sizeof(sunxi_de_fe_debug_lvl),
+		.mode         = 0644,
+		.proc_handler = proc_douintvec },
+	{ }
+};
+
+static struct ctl_table_header *sunxi_de_fe_table_header;
+
+static struct regmap_config sunxi_fe_regmap_config = {
+	.reg_bits	= 32,
+	.val_bits	= 32,
+	.reg_stride	= 4,
+	.max_register 	= 0x0A14
+};
+
+static struct sunxi_de_fe_fmt formats[] = {
+	{
+		.fourcc = V4L2_PIX_FMT_SUNXI,
+		.types	= SUNXI_DE_FE_OUTPUT,
+		.depth = 8,
+		.num_planes = 2,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_SUNXI,
+		.types	= SUNXI_DE_FE_CAPTURE,
+		.depth = 8,
+		.num_planes = 2,
+	},
+};
+
+static struct sunxi_de_fe_fmt *find_format(struct v4l2_format *f)
+{
+	struct sunxi_de_fe_fmt *fmt;
+	unsigned int k;
+
+	PRINT_DE_FE("de_fe %s();\n", __FUNCTION__);
+	for (k = 0; k < NUM_FORMATS; k++) {
+		fmt = &formats[k];
+		if (fmt->fourcc == f->fmt.pix_mp.pixelformat) {
+			break;
+		}
+	}
+
+	if (k == NUM_FORMATS) {
+		return NULL;
+	}
+
+	return &formats[k];
+}
+
+static inline struct sunxi_de_fe_ctx *file2ctx(struct file *file)
+{
+
+	PRINT_DE_FE("de_fe %s();\n", __FUNCTION__);
+	return container_of(file->private_data, struct sunxi_de_fe_ctx, fh);
+}
+
+static int vidioc_s_fmt(struct sunxi_de_fe_ctx *ctx, struct v4l2_format *f)
+{
+	struct v4l2_pix_format_mplane *pix_fmt_mp;
+	struct sunxi_de_fe_fmt *fmt;
+	int i;
+
+	pix_fmt_mp = &f->fmt.pix_mp;
+
+	PRINT_DE_FE("de_fe %s();\n", __FUNCTION__);
+	if (ctx == NULL) {
+		printk("Frontend set fmt called without context\n");
+	}
+
+	switch (f->type) {
+	case V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE:
+		ctx->vpu_src_fmt = find_format(f);
+		ctx->src_fmt = *pix_fmt_mp;
+		break;
+	case V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE:
+		fmt = find_format(f);
+		ctx->vpu_dst_fmt = fmt;
+
+		for (i = 0; i < fmt->num_planes; ++i) {
+			pix_fmt_mp->plane_fmt[i].bytesperline =
+			    pix_fmt_mp->width * fmt->depth;
+			pix_fmt_mp->plane_fmt[i].sizeimage =
+			    pix_fmt_mp->plane_fmt[i].bytesperline *
+			    pix_fmt_mp->height;
+		}
+		ctx->dst_fmt = *pix_fmt_mp;
+		break;
+	default:
+		PRINT_DE_FE("Frontend: invalid buf type\n");
+		return -EINVAL;
+	}
+
+	printk("Frontend output format is %dx%d.\n", pix_fmt_mp->width,
+	    pix_fmt_mp->height);
+
+	return 0;
+}
+
+static int enum_fmt(struct v4l2_fmtdesc *f, u32 type)
+{
+	int i, num;
+	struct sunxi_de_fe_fmt *fmt;
+
+	PRINT_DE_FE("de_fe %s\n", __FUNCTION__);
+	num = 0;
+
+	PRINT_DE_FE("de_fe Looking for format %d\n", type);
+	PRINT_DE_FE("de_fe The following formats are supported:");
+	for (i = 0; i < NUM_FORMATS; ++i) {
+		PRINT_DE_FE("de_fe , %d", formats[i].types);
+		if (formats[i].types & type) {
+			PRINT_DE_FE("de_fe (type match) f->index = %d",
+			    f->index);
+			/* index-th format of type type found ? */
+			if (num == f->index){
+				PRINT_DE_FE("de_fe (th format found)");
+				break;
+			}
+			/*
+			 * Correct type but haven't reached our index yet,
+			 * just increment per-type index
+			 */
+			++num;
+		}
+	}
+
+	if (i < NUM_FORMATS) {
+		fmt = &formats[i];
+		f->pixelformat = fmt->fourcc;
+		return 0;
+	}
+
+	/* Format not found */
+	PRINT_DE_FE("de_fe CANNOT FIND FORMAT :(\n");
+	return -EINVAL;
+}
+
+
+static int vidioc_querycap(struct file *file, void *priv,
+    struct v4l2_capability *cap)
+{
+
+	PRINT_DE_FE("de_fe %s();\n", __FUNCTION__);
+	strncpy(cap->driver, DRV_NAME, sizeof(cap->driver) - 1);
+	strncpy(cap->card, DRV_NAME, sizeof(cap->card) - 1);
+	snprintf(cap->bus_info, sizeof(cap->bus_info), "platform:%s",
+	    DRV_NAME);
+	cap->device_caps = V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING;
+	cap->capabilities = cap->device_caps | V4L2_CAP_DEVICE_CAPS;
+	return 0;
+}
+
+static int vidioc_g_fmt(struct sunxi_de_fe_ctx *ctx, struct v4l2_format *f)
+{
+
+	PRINT_DE_FE("de_fe %s();\n", __FUNCTION__);
+	switch (f->type) {
+	case V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE:
+		f->fmt.pix_mp = ctx->dst_fmt;
+		break;
+	case V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE:
+		f->fmt.pix_mp = ctx->src_fmt;
+		break;
+	default:
+		PRINT_DE_FE("de_fe invalid buf type\n");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int vidioc_enum_fmt_vid_cap(struct file *file, void *priv,
+    struct v4l2_fmtdesc *f)
+{
+
+	PRINT_DE_FE("de_fe %s();\n", __FUNCTION__);
+	return enum_fmt(f, SUNXI_DE_FE_CAPTURE);
+}
+
+static int vidioc_g_fmt_vid_cap(struct file *file, void *priv,
+    struct v4l2_format *f)
+{
+
+	PRINT_DE_FE("de_fe %s();\n", __FUNCTION__);
+	return vidioc_g_fmt(file2ctx(file), f);
+}
+
+static int vidioc_try_fmt(struct v4l2_format *f, struct sunxi_de_fe_fmt *fmt)
+{
+	int i;
+	__u32 bpl;
+
+	PRINT_DE_FE("de_fe %s();\n", __FUNCTION__);
+
+	f->fmt.pix_mp.field = V4L2_FIELD_NONE;
+	f->fmt.pix_mp.num_planes = fmt->num_planes;
+
+	switch (f->type) {
+	case V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE:
+		// if (f->fmt.pix_mp.plane_fmt[0].sizeimage == 0)
+		// 	return -EINVAL;
+
+		// f->fmt.pix_mp.plane_fmt[0].bytesperline = 0;
+		// break;
+
+		/* FALL THROUGH */
+	case V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE:
+		//TODO: come back and check this loop Thomas
+		for (i = 0; i < f->fmt.pix_mp.num_planes; ++i) {
+			bpl = (f->fmt.pix_mp.width * fmt->depth) >> 3;
+			f->fmt.pix_mp.plane_fmt[i].bytesperline = bpl;
+			f->fmt.pix_mp.plane_fmt[i].sizeimage =
+				f->fmt.pix_mp.height * bpl;
+		}
+		break;
+	}
+	return 0;
+}
+
+static int vidioc_try_fmt_vid_cap(struct file *file, void *priv,
+    struct v4l2_format *f)
+{
+	struct sunxi_de_fe_fmt *fmt;
+	struct sunxi_de_fe_ctx *ctx;
+
+	ctx = file2ctx(file);
+	PRINT_DE_FE("de_fe %s();\n", __FUNCTION__);
+
+	fmt = find_format(f);
+	if (!fmt) {
+		f->fmt.pix_mp.pixelformat = formats[0].fourcc;
+		fmt = find_format(f);
+	}
+	return vidioc_try_fmt(f, fmt);
+}
+
+static int vidioc_s_fmt_vid_cap(struct file *file, void *priv,
+    struct v4l2_format *f)
+{
+	int ret;
+
+	ret = vidioc_try_fmt_vid_cap(file, priv, f);
+	if (ret)
+		return ret;
+
+	return vidioc_s_fmt(file2ctx(file), f);
+}
+
+static int vidioc_enum_fmt_vid_out(struct file *file, void *priv,
+    struct v4l2_fmtdesc *f)
+{
+
+	PRINT_DE_FE("de_fe %s();\n", __FUNCTION__);
+	return 0;
+}
+
+
+static int vidioc_g_fmt_vid_out(struct file *file, void *priv,
+    struct v4l2_format *f)
+{
+
+	PRINT_DE_FE("de_fe %s();\n", __FUNCTION__);
+	return vidioc_g_fmt(file2ctx(file), f);
+}
+
+
+static int vidioc_try_fmt_vid_out(struct file *file, void *priv,
+    struct v4l2_format *f)
+{
+	struct sunxi_de_fe_fmt *fmt;
+	struct sunxi_de_fe_ctx *ctx = file2ctx(file);
+
+	PRINT_DE_FE("de_fe %s();\n", __FUNCTION__);
+	fmt = find_format(f);
+	if (!fmt) {
+		f->fmt.pix_mp.pixelformat = formats[0].fourcc;
+		fmt = find_format(f);
+	}
+	if (!(fmt->types & SUNXI_DE_FE_OUTPUT)) {
+		PRINT_DE_FE("Frontend: Fourcc format (0x%08x) invalid.\n",
+		    f->fmt.pix_mp.pixelformat);
+		return -EINVAL;
+	}
+
+	return vidioc_try_fmt(f, fmt);
+}
+
+static int vidioc_s_fmt_vid_out(struct file *file, void *priv,
+    struct v4l2_format *f)
+{
+	int ret;
+
+	PRINT_DE_FE("de_fe %s();\n", __FUNCTION__);
+
+	ret = vidioc_try_fmt_vid_out(file, priv, f);
+	if (ret)
+		return ret;
+
+	printk("a\n");
+	ret = vidioc_s_fmt(file2ctx(file), f);
+	printk("b\n");
+	return ret;
+}
+
+/*
+ * device_run() - prepares and starts processing
+ */
+static void device_run(void *priv)
+{
+	struct sunxi_de_fe_ctx *ctx;
+	struct sunxi_de_fe_ctx *curr_ctx;
+	struct vb2_v4l2_buffer *in_vb, *out_vb;
+	dma_addr_t in_luma, in_chroma, out_luma, out_chroma;
+	int ret;
+
+	ctx = priv;
+	PRINT_DE_FE("de_fe %s();\n", __FUNCTION__);
+
+	in_vb = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
+	out_vb = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
+
+	in_luma = vb2_dma_contig_plane_dma_addr(&in_vb->vb2_buf, 0);
+	in_chroma = vb2_dma_contig_plane_dma_addr(&in_vb->vb2_buf, 1);
+
+	out_luma = vb2_dma_contig_plane_dma_addr(&out_vb->vb2_buf, 0);
+	out_chroma = vb2_dma_contig_plane_dma_addr(&out_vb->vb2_buf, 1);
+
+	 // Luma is Y, chroma is color UV.
+	in_luma -= PHYS_OFFSET;
+	in_chroma -= PHYS_OFFSET;
+	out_luma -= PHYS_OFFSET;
+	out_chroma -= PHYS_OFFSET;
+
+	PRINT_DE_FE("de fe: in_luma = 0x%x\n", in_luma);
+	PRINT_DE_FE("de fe: in_chroma = 0x%x\n", in_chroma);
+	PRINT_DE_FE("de fe: out_luma = 0x%x\n", out_luma);
+	PRINT_DE_FE("de fe: out_chroma = 0x%x\n", out_chroma);
+
+	//TODO: Get this from a GEM/DMA_BUF buffer handle
+	ret = regmap_write(sunxi_fe_dev->regs, DEFE_BUF_ADDR0_REG, in_luma);
+	if (ret == -EIO)
+		printk("Could not set y input addr.\n");
+
+	ret = regmap_write(sunxi_fe_dev->regs, DEFE_BUF_ADDR1_REG,
+	    in_chroma);
+	if (ret == -EIO)
+		printk("Could not set uv input addr.\n");
+
+	if (regmap_update_bits(sunxi_fe_dev->regs, DEFE_FRM_CTRL_REG,
+	    DEFE_REG_RDY_MASK | DEFE_FRM_START_START_MASK,
+	    DEFE_REG_RDY_EN(ENABLE) | DEFE_FRM_START_BIT(ENABLE))) {
+		printk("Could not start frontend.\n");
+		return -1;
+	}
+
+	curr_ctx = v4l2_m2m_get_curr_priv(ctx->dev->m2m_dev);
+
+	// The following v4l2 calls should go to an irq done.
+	in_vb = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
+	out_vb = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
+
+	v4l2_m2m_buf_done(in_vb, VB2_BUF_STATE_DONE);
+	v4l2_m2m_buf_done(out_vb, VB2_BUF_STATE_DONE);
+	v4l2_m2m_job_finish(ctx->dev->m2m_dev, curr_ctx->fh.m2m_ctx);
+}
+
+static void job_abort(void *priv)
+{
+
+	PRINT_DE_FE("de_fe %s();\n", __FUNCTION__);
+	/* Maybe move stuff from the release to here? */
+	printk("Frontend job_abort :D \n");
+}
+
+/*
+ * The noop_llseek() is an llseek() operation that filesystems can use that
+ * don't want to support seeking (leave the file->f_pos untouched) but still
+ * want to let the syscall itself to succeed.
+ *
+ * [PATCH 01/15] Introduce noop_llseek()
+ * http://www.spinics.net/lists/linux-fsdevel/msg28104.html
+ */
+static const struct file_operations sunxi_fe_fops = {
+	.owner		= THIS_MODULE,
+	.unlocked_ioctl	= &sunxi_fe_ioctl,
+	.write		= proc_sunxi_de_fe_write,
+	.llseek		= noop_llseek,
+};
+
+static const struct v4l2_file_operations sunxi_fe_v4l2_fops = {
+	.owner		= THIS_MODULE,
+	.open		= sunxi_fe_open,
+	.release	= sunxi_fe_release,
+	.poll		= v4l2_m2m_fop_poll,
+	.unlocked_ioctl	= video_ioctl2,
+	.mmap		= v4l2_m2m_fop_mmap,
+};
+
+/*
+ * Disabled some ioc as this driver will handle preallocated buffers by the
+ * cedrus driver.
+ */
+static const struct v4l2_ioctl_ops sunxi_fe_v4l2_ioctl_ops = {
+	.vidioc_querycap			= vidioc_querycap,
+
+	.vidioc_enum_fmt_vid_cap	= vidioc_enum_fmt_vid_cap,
+	.vidioc_g_fmt_vid_cap_mplane	= vidioc_g_fmt_vid_cap,
+	.vidioc_try_fmt_vid_cap_mplane	= vidioc_try_fmt_vid_cap,
+	.vidioc_s_fmt_vid_cap_mplane	= vidioc_s_fmt_vid_cap,
+
+	.vidioc_enum_fmt_vid_out_mplane = vidioc_enum_fmt_vid_out,
+	.vidioc_g_fmt_vid_out_mplane	= vidioc_g_fmt_vid_out,
+	.vidioc_try_fmt_vid_out_mplane	= vidioc_try_fmt_vid_out,
+	.vidioc_s_fmt_vid_out_mplane	= vidioc_s_fmt_vid_out,
+
+	.vidioc_reqbufs		= v4l2_m2m_ioctl_reqbufs,
+	.vidioc_querybuf	= v4l2_m2m_ioctl_querybuf,
+	.vidioc_prepare_buf	= v4l2_m2m_ioctl_prepare_buf,
+	.vidioc_create_bufs	= v4l2_m2m_ioctl_create_bufs,
+	.vidioc_expbuf		= v4l2_m2m_ioctl_expbuf,
+
+	.vidioc_qbuf		= v4l2_m2m_ioctl_qbuf,
+	.vidioc_dqbuf		= v4l2_m2m_ioctl_dqbuf,
+
+	.vidioc_streamon	= v4l2_m2m_ioctl_streamon,
+	.vidioc_streamoff	= v4l2_m2m_ioctl_streamoff,
+};
+
+static struct v4l2_m2m_ops m2m_ops = {
+	.device_run	= device_run,
+	.job_abort	= job_abort,
+};
+
+/* This replaces the platform device. */
+static struct video_device sunxi_de_fe_viddev = {
+	.name		= DRV_NAME,
+	.vfl_dir	= VFL_DIR_M2M,
+	.fops		= &sunxi_fe_v4l2_fops,
+	.ioctl_ops	= &sunxi_fe_v4l2_ioctl_ops,
+	.minor		= -1,
+	.release	= video_device_release_empty,
+};
+
+static sfe_ioctl_set_input(unsigned long arg)
+{
+	struct sfe_input_buffers input_buffers;
+	uint32_t i;
+
+	printk("SFE_IOCTL_SET_INPUT\n");
+	if ((void __user *)arg == NULL) {
+		printk("Error: input_buffers == NULL\n");
+		return -EINVAL;
+	}
+
+	if (copy_from_user(&input_buffers, (void __user *)arg,
+	    sizeof(input_buffers))) {
+		printk("Error getting input buffers from user\n");
+		return -EFAULT;
+	}
+
+	switch (sunxi_fe_dev->input_fmt) {
+	case DRM_FORMAT_YUV420:
+		//TODO: Check for a YUV420 TILED define.
+		printk("configured input format is DRM_FORMAT_YUV420\n");
+		/*
+		 * The 1st buffer contains Y buffer data.
+		 * The 2nd buffer contains UV buffer data.
+		 */
+		for (i = 0; i < 2; i++) {
+			if (input_buffers.buf[i].base == NULL) {
+				printk("Input format is set to YUV420. "
+				    "Therefore the first 2 buffers in "
+				    "input_buffers cannot be NULL\n");
+				return -EINVAL;
+			}
+
+			if (input_buffers.buf[i].size_in_bytes < 1) {
+				printk("Buffer size cannot be less than 1\n");
+				return -EINVAL;
+			}
+
+			PRINT_DE_FE("Before copy_from_user usr_ptr = %p\n",
+			    input_buffers.buf[i].base);
+
+			//TODO: Buffers are already alloced in open call and
+			// freed in release. Make it so that the copy is not
+			// needed anymore.
+			if (copy_from_user(sunxi_fe_dev->in_bufs.buf[i].base,
+			    input_buffers.buf[i].base,
+			    input_buffers.buf[i].size_in_bytes)) {
+				printk("Failed copying buffer from userland\n");
+				return -EFAULT;
+			}
+			PRINT_DE_FE("After copy_from_user\n");
+			sunxi_fe_dev->in_bufs.buf[i].size_in_bytes =
+			    input_buffers.buf[i].size_in_bytes;
+		}
+		break;
+	default:
+		printk("Error: Front end configuration is not set or "
+		    "unsupported\n");
+		return -EINVAL;
+	}
+	PRINT_DE_FE("Succesfully parsed %d input buffers from userland\n", i);
+}
+
+static long sunxi_fe_ioctl(struct file *filp, unsigned int cmd,
+    unsigned long arg)
+{
+	struct sfe_config user_config;
+	struct v4l2_buffer buf;
+
+	/*
+	 * The ioctl()s defined here are for testing purposes only and have
+	 * been used during bring-up.
+	 */
+	PRINT_DE_FE("sunxi_fe_ioctl filp %p, cmd %x, arg 0x%lx\n", filp, cmd,
+	    arg);
+
+	switch (cmd) {
+	case SFE_IOCTL_TEST:
+		printk("SFE_IOCTL_TEST_CMD\n");
+		break;
+	case SFE_IOCTL_UPDATE_BUFFER:
+		PRINT_DE_FE("SFE_IOCTL_UPDATE_BUFFER\n");
+		if ((void __user *)arg == NULL) {
+			printk("Error: user_config == NULL\n");
+			return -EINVAL;
+		}
+
+		if (copy_from_user(&buf, (void __user *)arg, sizeof(buf))) {
+			printk("Error in copy buf from user\n");
+			return -EFAULT;
+		}
+
+		PRINT_DE_FE("Got a buffer from userland.\n");
+		PRINT_DE_FE("buf fd = 0x%x\n", buf.m.fd);
+
+		if (regmap_write(sunxi_fe_dev->regs, DEFE_FRM_CTRL_REG,
+		    DEFE_REG_RDY_EN(ENABLE) | DEFE_FRM_START_BIT(ENABLE))) {
+			printk("Could not start frontend.\n");
+			return -1;
+		}
+		break;
+	case SFE_IOCTL_SET_CONFIG:
+		printk("SFE_IOCTL_CONFIG\n");
+		if ((void __user *)arg == NULL) {
+			printk("Error: user_config == NULL\n");
+			return -EINVAL;
+		}
+
+		if (copy_from_user(&user_config, (void __user *)arg,
+		    sizeof(user_config))) {
+			printk("Error in copy configuration from user\n");
+			return -EFAULT;
+		}
+
+		if (user_config.in_width < MIN_WIDTH ||
+		    user_config.in_width > MAX_WIDTH ||
+		    user_config.in_height < MIN_HEIGHT ||
+		    user_config.in_height > MAX_HEIGHT ||
+		    user_config.out_width < MIN_WIDTH ||
+		    user_config.out_width > MAX_WIDTH ||
+		    user_config.out_height < MIN_HEIGHT ||
+		    user_config.out_height > MAX_HEIGHT) {
+			printk("Error: Dimensions out of range.\n");
+			return -EINVAL;
+		}
+
+		if (user_config.input_fmt != DRM_FORMAT_YUV420) {
+			printk("Error: Unsupported input format.\n");
+			return -EINVAL;
+		}
+
+		if (user_config.output_fmt != DRM_FORMAT_XRGB8888) {
+			printk("Error: Unsupported output format.\n");
+			return -EINVAL;
+		}
+
+		// Store the sane values.
+		sunxi_fe_dev->input_fmt = user_config.input_fmt;
+		sunxi_fe_dev->output_fmt = user_config.output_fmt;
+		sunxi_fe_dev->in_width = user_config.in_width;
+		sunxi_fe_dev->in_height = user_config.in_height;
+		sunxi_fe_dev->out_width = user_config.out_width;
+		sunxi_fe_dev->out_height = user_config.out_height;
+
+		if (setup_fe_idma_channels(sunxi_fe_dev)) {
+			printk("Error: Could not configure input channels "
+			    "with current settings.\n");
+			return -1;
+		}
+
+		if (setup_fe_odma_channels(sunxi_fe_dev)) {
+			printk("Error: Could not configure output channels "
+			    "with current settings.\n");
+			return -1;
+		}
+		
+		/*
+		 * When the front-end has been configured correctly, we don't
+		 * need two write here for the new image to appear.
+		 */
+		if (regmap_write(sunxi_fe_dev->regs, DEFE_FRM_CTRL_REG,
+		    DEFE_REG_RDY_EN(ENABLE) | DEFE_COEF_RDY_EN(ENABLE) |
+		    DEFE_FRM_START_BIT(ENABLE))) {
+			printk("Could not start frontend.\n");
+			return -1;
+		}
+		msleep(100);
+		if (regmap_write(sunxi_fe_dev->regs, DEFE_FRM_CTRL_REG,
+		    DEFE_REG_RDY_EN(ENABLE) | DEFE_COEF_RDY_EN(ENABLE) |
+		    DEFE_FRM_START_BIT(ENABLE))) {
+			printk("Could not start frontend.\n");
+			return -1;
+		}
+		printk("Front end has been configured.\n");
+
+		break;
+	case SFE_IOCTL_SET_INPUT:
+		sfe_ioctl_set_input(arg);
+		break;
+	default:
+		printk("Unsupported cmd used x0%x\n", cmd);
+		break;
+	}
+	return 0;
+}
+
+/* Queue operations */
+static int sunxi_de_fe_queue_setup(struct vb2_queue *vq, unsigned int *nbufs,
+    unsigned int *nplanes, unsigned int sizes[], struct device *alloc_devs[])
+{
+	struct sunxi_de_fe_ctx *ctx;
+
+	ctx = vb2_get_drv_priv(vq);
+	PRINT_DE_FE("de_fe %s();\n", __FUNCTION__);
+
+	if (*nbufs < 1)
+		*nbufs = 1;
+
+	if (*nbufs > VIDEO_MAX_FRAME)
+		*nbufs = VIDEO_MAX_FRAME;
+
+	switch (vq->type) {
+	case V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE:
+		*nplanes = ctx->vpu_src_fmt->num_planes;
+		sizes[0] = ctx->src_fmt.plane_fmt[0].sizeimage;
+		break;
+	case V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE:
+		*nplanes = ctx->vpu_dst_fmt->num_planes;
+
+		sizes[0] = round_up(ctx->dst_fmt.plane_fmt[0].sizeimage, 8);
+		sizes[1] = sizes[0];
+		break;
+	default:
+		PRINT_DE_FE("Frontend: invalid queue type: %d\n", vq->type);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int sunxi_de_fe_buf_init(struct vb2_buffer *vb)
+{
+	struct vb2_queue *vq;
+	struct sunxi_de_fe_ctx *ctx;
+
+	vq = vb->vb2_queue;
+	ctx = container_of(vq->drv_priv, struct sunxi_de_fe_ctx, fh);
+	PRINT_DE_FE("de_fe %s();\n", __FUNCTION__);
+
+	if (vq->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
+		ctx->dst_bufs[vb->index] = vb;
+
+	return 0;
+}
+
+static void sunxi_de_fe_buf_cleanup(struct vb2_buffer *vb)
+{
+	struct vb2_queue *vq;
+	struct sunxi_de_fe_ctx *ctx;
+
+	vq = vb->vb2_queue;
+	ctx = container_of(vq->drv_priv, struct sunxi_de_fe_ctx, fh);
+
+	PRINT_DE_FE("de_fe %s();\n", __FUNCTION__);
+
+	if (vq->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
+		ctx->dst_bufs[vb->index] = NULL;
+}
+
+static int sunxi_de_fe_buf_prepare(struct vb2_buffer *vb)
+{
+	struct sunxi_de_fe_ctx *ctx;
+	struct vb2_queue *vq;
+	int i;
+
+	ctx = vb2_get_drv_priv(vb->vb2_queue);
+	vq = vb->vb2_queue;
+	PRINT_DE_FE("de_fe %s();\n", __FUNCTION__);
+
+	switch (vq->type) {
+	case V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE:
+		if (vb2_plane_size(vb, 0) <
+		    ctx->src_fmt.plane_fmt[0].sizeimage)
+			return -EINVAL;
+		break;
+
+	case V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE:
+		for (i = 0; i < ctx->vpu_dst_fmt->num_planes; ++i)
+			if (vb2_plane_size(vb, i) <
+			    ctx->dst_fmt.plane_fmt[i].sizeimage)
+				break;
+
+		if (i != ctx->vpu_dst_fmt->num_planes)
+			return -EINVAL;
+		break;
+	default:
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static void sunxi_de_fe_stop_streaming(struct vb2_queue *q)
+{
+	struct sunxi_de_fe_ctx *ctx = vb2_get_drv_priv(q);
+	struct vb2_v4l2_buffer *vbuf;
+	unsigned long flags;
+
+	ctx = vb2_get_drv_priv(q);
+	PRINT_DE_FE("de_fe %s();\n", __FUNCTION__);
+
+	while (1) {
+		if (V4L2_TYPE_IS_OUTPUT(q->type))
+			vbuf = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
+		else
+			vbuf = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
+		if (!vbuf)
+			return;
+		// spin_lock_irqsave(&ctx->dev->irqlock, flags);
+		v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_ERROR);
+		// spin_unlock_irqrestore(&ctx->dev->irqlock, flags);
+	}
+}
+
+static void sunxi_de_fe_buf_queue(struct vb2_buffer *vb)
+{
+	struct vb2_v4l2_buffer *vbuf;
+	struct sunxi_de_fe_ctx *ctx;
+
+	vbuf = to_vb2_v4l2_buffer(vb);
+	ctx = vb2_get_drv_priv(vb->vb2_queue);
+	PRINT_DE_FE("de_fe %s();\n", __FUNCTION__);
+
+	v4l2_m2m_buf_queue(ctx->fh.m2m_ctx, vbuf);
+}
+
+static struct vb2_ops sunxi_de_fe_qops = {
+	.queue_setup	 = sunxi_de_fe_queue_setup,
+	.buf_prepare	 = sunxi_de_fe_buf_prepare,
+	.buf_init	 = sunxi_de_fe_buf_init,
+	.buf_cleanup	 = sunxi_de_fe_buf_cleanup,
+	.buf_queue	 = sunxi_de_fe_buf_queue,
+	.stop_streaming  = sunxi_de_fe_stop_streaming,
+	.wait_prepare	 = vb2_ops_wait_prepare,
+	.wait_finish	 = vb2_ops_wait_finish,
+};
+
+static int queue_init(void *priv, struct vb2_queue *src_vq,
+    struct vb2_queue *dst_vq)
+{
+	struct sunxi_de_fe_ctx *ctx = priv;
+	int ret;
+
+	ctx = priv;
+	PRINT_DE_FE("de_fe %s();\n", __FUNCTION__);
+
+	src_vq->type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+	src_vq->io_modes = VB2_MMAP | VB2_DMABUF | VB2_USERPTR;
+	src_vq->drv_priv = ctx;
+	src_vq->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
+	src_vq->ops = &sunxi_de_fe_qops;
+	src_vq->mem_ops = &vb2_dma_contig_memops;
+	src_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
+	// src_vq->lock = &ctx->dev->dev_mutex;
+	src_vq->v4l2_allow_requests = true;
+	src_vq->dev = ctx->dev->dev;
+
+	ret = vb2_queue_init(src_vq);
+	if (ret)
+		return ret;
+
+	dst_vq->type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+	dst_vq->io_modes = VB2_MMAP | VB2_DMABUF | VB2_USERPTR;
+	dst_vq->drv_priv = ctx;
+	dst_vq->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
+	dst_vq->ops = &sunxi_de_fe_qops;
+	dst_vq->mem_ops = &vb2_dma_contig_memops;
+	dst_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
+	// dst_vq->lock = &ctx->dev->dev_mutex;
+	dst_vq->v4l2_allow_requests = true;
+	dst_vq->dev = ctx->dev->dev;
+
+	return vb2_queue_init(dst_vq);
+}
+
+static int sunxi_fe_open(struct file *file)
+{
+	struct sunxi_fe_device *dev;
+	struct sunxi_de_fe_ctx *ctx = NULL;
+	struct v4l2_ctrl_handler *hdl;
+	uint32_t i, max_buffer_size;
+	int rc = 0;
+
+	dev = video_drvdata(file);
+	PRINT_DE_FE("de_fe %s();\n", __FUNCTION__);
+
+	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+	if (!ctx) {
+		rc = -ENOMEM;
+		goto open_unlock;
+	}
+
+	v4l2_fh_init(&ctx->fh, video_devdata(file));
+	file->private_data = &ctx->fh;
+	ctx->dev = dev;
+	hdl = &ctx->hdl;
+	v4l2_ctrl_handler_init(hdl, 1);
+
+	if (hdl->error) {
+		rc = hdl->error;
+		v4l2_ctrl_handler_free(hdl);
+		goto open_unlock;
+	}
+	ctx->fh.ctrl_handler = hdl;
+	v4l2_ctrl_handler_setup(hdl);
+
+	ctx->fh.m2m_ctx = v4l2_m2m_ctx_init(dev->m2m_dev, ctx, &queue_init);
+
+	if (IS_ERR(ctx->fh.m2m_ctx)) {
+		rc = PTR_ERR(ctx->fh.m2m_ctx);
+
+		v4l2_ctrl_handler_free(hdl);
+		kfree(ctx);
+		goto open_unlock;
+	}
+
+	v4l2_fh_add(&ctx->fh);
+
+	if (regmap_update_bits(sunxi_fe_dev->regs, DEFE_EN_REG,
+	    DEFE_EN_MASK, DEFE_EN_BIT(ENABLE)) == -EIO) {
+		printk("Could not enable front end\n");
+		return -1;
+	}
+
+	if (setup_csc(sunxi_fe_dev) < 0) {
+		printk("Error: Could not configure color space converter with "
+		    "current settings.\n");
+		return -1;
+	}
+
+	if (regmap_write(sunxi_fe_dev->regs, DEFE_FRM_CTRL_REG,
+	    DEFE_COEF_RDY_EN(ENABLE))) {
+		printk("Could not mark coef regs rdy.\n");
+		return -1;
+	}
+	
+	PRINT_DE_FE("Opened de fe device\n");
+	return 0;
+
+open_unlock:
+	// mutex_unlock(&dev->dev_mutex);
+	return rc;
+}
+
+static int sunxi_fe_release(struct file *file)
+{
+	struct sunxi_de_fe_dev *dev;
+	struct sunxi_de_fe_ctx *ctx;
+	uint32_t i, max_buffer_size;
+
+	dev = video_drvdata(file);
+	ctx = container_of(file->private_data, struct sunxi_de_fe_ctx, fh);
+	PRINT_DE_FE("de_fe %s();\n", __FUNCTION__);
+
+	if (regmap_update_bits(sunxi_fe_dev->regs, DEFE_EN_REG,
+	    DEFE_EN_MASK, DEFE_EN_BIT(DISABLE)) == -EIO) {
+		printk("Could not enable front end\n");
+		return -1;
+	}
+
+	v4l2_fh_del(&ctx->fh);
+	v4l2_fh_exit(&ctx->fh);
+	v4l2_ctrl_handler_free(&ctx->hdl);
+	ctx->mpeg2_frame_hdr_ctrl = NULL;
+	ctx->mpeg4_frame_hdr_ctrl = NULL;
+	// mutex_lock(&dev->dev_mutex);
+	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
+	// mutex_unlock(&dev->dev_mutex);
+	kfree(ctx);
+
+	return 0;
+}
+
+static ssize_t proc_sunxi_de_fe_write(struct file *filp, const char *buf,
+    size_t count, loff_t *offp) {
+
+	PRINT_DE_FE("de_fe %s();\n", __FUNCTION__);
+	copy_from_user(de_fe_msg, buf, count);
+	return count;
+}
+
+static int sunxi_fe_regmap_init(struct sunxi_fe_device *sunxi_fe_dev,
+    struct platform_device *pdev) {
+	struct resource *res;
+	void __iomem *regs;
+
+	PRINT_DE_FE("de_fe %s();\n", __FUNCTION__);
+	
+	// Appears this result cannot be checked :(
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	regs = devm_ioremap_resource(sunxi_fe_dev->dev, res);
+	if (IS_ERR(regs)) {
+		printk("Could not ioremap\n");
+		return PTR_ERR(regs);
+	}
+
+	sunxi_fe_dev->regs = devm_regmap_init_mmio(sunxi_fe_dev->dev, regs,
+	    &sunxi_fe_regmap_config);
+	if (IS_ERR(sunxi_fe_dev->regs)) {
+		printk("Could not regmap\n");
+		return PTR_ERR(sunxi_fe_dev->regs);
+	}
+	return 0;
+}
+
+/* Platform driver setup
+ * https://lwn.net/Articles/448499/
+ */
+static int sunxi_fe_probe(struct platform_device *pdev)
+{
+	struct video_device *vfd;
+	int ret;
+
+	printk("sunxi front end probe");
+
+	sunxi_fe_dev = devm_kzalloc(&pdev->dev, sizeof(*sunxi_fe_dev),
+	    GFP_KERNEL);
+	if (sunxi_fe_dev == NULL) {
+		printk("Error: failed allocating for sunxi front end\n");
+		return -ENOMEM;
+	}
+
+	// platform_set_drvdata(pdev, sunxi_fe_dev);
+	sunxi_fe_dev->dev = &pdev->dev;
+	sunxi_fe_dev->phys_name = dev_name(&pdev->dev);
+
+	ret = sunxi_fe_regmap_init(sunxi_fe_dev, pdev);
+	if (ret < 0)
+		return ret;
+
+	sunxi_fe_dev->reset = devm_reset_control_get(&pdev->dev, NULL);
+	if (IS_ERR(sunxi_fe_dev->reset)) {
+		printk("Couldn't get our reset line\n");
+		return PTR_ERR(sunxi_fe_dev->reset);
+	}
+
+	ret = reset_control_deassert(sunxi_fe_dev->reset);
+	if (ret) {
+		printk("Could not deassert our reset line\n");
+		return ret;
+	}
+
+	sunxi_fe_dev->ahb_clk = devm_clk_get(&pdev->dev, "ahb");
+	if (IS_ERR(sunxi_fe_dev->ahb_clk)) {
+		printk("failed to get ahb clock");
+		ret = PTR_ERR(sunxi_fe_dev->ahb_clk);
+		goto err_assert_reset;
+	}
+	ret = clk_prepare_enable(sunxi_fe_dev->ahb_clk);
+	if (ret) {
+		printk("failed to prepare enable ahb_clk\n");
+		ret = PTR_ERR(sunxi_fe_dev->ahb_clk);
+		goto err_assert_reset;
+	}
+
+	sunxi_fe_dev->ram_clk = devm_clk_get(&pdev->dev, "ram");
+	if (IS_ERR(sunxi_fe_dev->ram_clk)) {
+		printk("failed to get ram clock");
+		ret = PTR_ERR(sunxi_fe_dev->ram_clk);
+		goto err_disable_ahb_clk;
+	}
+	ret = clk_prepare_enable(sunxi_fe_dev->ram_clk);
+	if (ret) {
+		printk("failed to prepare enable ram_clk\n");
+		goto err_disable_ahb_clk;
+	}
+
+	sunxi_fe_dev->mod_clk = devm_clk_get(&pdev->dev, "mod");
+	if (IS_ERR(sunxi_fe_dev->mod_clk)) {
+		printk("failed to get mod clock");
+		ret = PTR_ERR(sunxi_fe_dev->mod_clk);
+		goto err_disable_ram_clk;
+
+	}
+	ret = clk_prepare_enable(sunxi_fe_dev->mod_clk);
+	if (ret) {
+		printk("failed to prepare enable mod_clk\n");
+		goto err_disable_ram_clk;
+	}
+
+	// Add /dev/sunxi_front_end entry
+	fe_miscdevice.minor = MISC_DYNAMIC_MINOR;
+	fe_miscdevice.name = FRONT_END_MODULE_NAME;
+	fe_miscdevice.fops = &sunxi_fe_fops;
+	fe_miscdevice.parent = get_device(&pdev->dev);
+	ret = misc_register(&fe_miscdevice);
+	if (ret != 0) {
+		printk("Error registering misc device\n");
+		goto err_disable_mod_clk;
+	}
+
+	ret = v4l2_device_register(&pdev->dev, &sunxi_fe_dev->v4l2_dev);
+	if (ret)
+		return ret;
+
+	sunxi_fe_dev->vfd = sunxi_de_fe_viddev;
+	vfd = &sunxi_fe_dev->vfd;
+	// vfd->lock = &sunxi_fe_dev->dev_mutex;
+	// TODO Enable IRQ ^
+	vfd->v4l2_dev = &sunxi_fe_dev->v4l2_dev;
+
+	ret = video_register_device(vfd, VFL_TYPE_GRABBER, 0);
+	if (ret)
+		goto unreg_dev;
+
+	video_set_drvdata(vfd, sunxi_fe_dev);
+	snprintf(vfd->name, sizeof(vfd->name), "%s", sunxi_de_fe_viddev.name);
+	printk("Frontend: Device registered as /dev/video%d\n", vfd->num);
+
+	sunxi_fe_dev->m2m_dev = v4l2_m2m_init(&m2m_ops);
+	if (IS_ERR(sunxi_fe_dev->m2m_dev)) {
+		printk("Frontend: Failed to init mem2mem device\n");
+		ret = PTR_ERR(sunxi_fe_dev->m2m_dev);
+		goto err_m2m;
+	}
+
+#ifdef CONFIG_PROC_FS
+	// Create the proc entry with permissions 666 (rw, rw, rw)
+	sunxi_fe_proc_entry = proc_create(FRONT_END_MODULE_NAME, S_IRUGO |
+	    S_IWUGO, NULL, &sunxi_fe_fops);
+	if (sunxi_fe_proc_entry == NULL) {
+		printk("Failed adding sunxi front end proc entry\n");
+		ret = -1;
+		goto err_disable_mod_clk;
+	}
+
+	sunxi_de_fe_table_header = register_sysctl_table(
+	    sunxi_de_fe_root_table);
+
+        if (!sunxi_de_fe_table_header)
+                return -ENOMEM;
+
+        /* Thomas: Create a /proc entry.
+         * Inspired by linux-sunxi/drivers/media/pci/zoran/videocodec.c
+         * CONFIG_PROC_FS seems to be needed in config. */
+         printk("Thomas: adding sunxi_de_fe /proc entry.\n");
+
+         /* from include/linux/proc_fs.h
+          * static inline struct proc_dir_entry *proc_create(
+          *     const char *name, umode_t mode, struct proc_dir_entry *parent,
+          *     const struct file_operations *proc_fops)
+          * {
+          *     return proc_create_data(name, mode, parent, proc_fops, NULL);
+          * }
+          */
+
+	// 10 is probebly enough
+	de_fe_msg = kmalloc(GFP_KERNEL, 10 * sizeof(char));
+
+#endif /* CONFIG_PROC_FS */
+
+	printk("Successfully added sunxi front end device\n");
+
+	return 0;
+
+err_m2m:
+	v4l2_m2m_release(sunxi_fe_dev->m2m_dev);
+	video_unregister_device(&sunxi_fe_dev->vfd);
+unreg_dev:
+	v4l2_device_unregister(&sunxi_fe_dev->v4l2_dev);
+err_disable_mod_clk:
+	clk_disable_unprepare(sunxi_fe_dev->mod_clk);
+err_disable_ram_clk:
+	clk_disable_unprepare(sunxi_fe_dev->ram_clk);
+err_disable_ahb_clk:
+	clk_disable_unprepare(sunxi_fe_dev->ahb_clk);
+err_assert_reset:
+	reset_control_assert(sunxi_fe_dev->reset);
+	return ret;
+}
+
+static int sunxi_fe_remove(struct platform_device *pdev)
+{
+
+	PRINT_DE_FE("de_fe %s();\n", __FUNCTION__);
+
+	v4l2_m2m_release(sunxi_fe_dev->m2m_dev);
+	video_unregister_device(&sunxi_fe_dev->vfd);
+	v4l2_device_unregister(&sunxi_fe_dev->v4l2_dev);
+
+	misc_deregister(&fe_miscdevice);
+	dev_info(&pdev->dev, "Removed sunxi front end driver\n");
+	return 0;
+}
+
+#ifdef CONFIG_OF
+static const struct of_device_id sunxi_fe_of_table[] = {
+	{ .compatible = "allwinner,sun7i-a20-front-end" },
+	{ .compatible = "allwinner,sun5i-a13-display-frontend" },
+};
+MODULE_DEVICE_TABLE(of, sunxi_fe_of_table);
+#endif
+
+static struct platform_driver sunxi_fe_platform_driver = {
+	.probe	= sunxi_fe_probe,
+	.remove	= sunxi_fe_remove,
+	.driver	= {
+		.name		= DRV_NAME,
+		.owner		= THIS_MODULE,
+		.of_match_table = of_match_ptr(sunxi_fe_of_table),
+	},
+};
+
+module_platform_driver(sunxi_fe_platform_driver);
+
+MODULE_AUTHOR("Thomas van Kleef <linux-dev@vitsch.nl>");
+MODULE_DESCRIPTION("Allwinner A20 Front End Driver");
+MODULE_LICENSE("GPL");
