@@ -40,7 +40,7 @@
 #define SUNXI_DE_FE_OUTPUT	BIT(0)
 #define NUM_FORMATS		ARRAY_SIZE(formats)
 
-uint32_t sunxi_de_fe_debug_lvl = 0;
+uint32_t sunxi_de_fe_debug_lvl = 10;
 char *de_fe_msg;
 
 static long sunxi_fe_ioctl(struct file *filp,
@@ -1004,7 +1004,7 @@ static int sunxi_fe_probe(struct platform_device *pdev)
 	struct video_device *vfd;
 	int ret;
 
-	printk("sunxi front end probe");
+	printk("/n/n/n/n/sunxi front end probe/n/n/n/n/n/n");
 
 	sunxi_fe_dev = devm_kzalloc(&pdev->dev, sizeof(*sunxi_fe_dev),
 	    GFP_KERNEL);
