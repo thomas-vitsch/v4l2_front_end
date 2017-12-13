@@ -21,6 +21,47 @@
 
 #define DRV_NAME "sunxi-front-end"
 
+/* This will force the backend layer 2 to take the forntend as an input. */
+#define HACK_BACKEND_LAYER2_TO_FRONTEND
+
+#ifdef HACK_BACKEND_LAYER2_TO_FRONTEND
+#define SUN7I_DEBE_BASE			0x01e60000
+#define SUN7I_DEBE_SIZE			0x5800
+
+#define SUN7I_DEBE_MODCTL_REG		0x800
+#define ENABLE_LAY2			BIT(10)
+
+//Datasheet states the laysize values adds 1. This seems to be incorrect.
+#define SUN7I_DEBE_LAYSIZE_REG_LAY2	0x818
+#define LAYSIZE_WIDTH(x)		((x))
+#define LAYSIZE_HEIGHT(x)		(((x)) << 16)
+
+#define SUN7I_DEBE_LAYCOOR_LAY2		0x828
+#define LAY_COOR_X(x)			(x)
+#define LAY_COOR_Y(y)			(y<<16)
+
+#define SUN7I_DEBE_REGBUFFCTL		0x870
+#define DIS_AUTOLOAD_REG		BIT(1)
+#define REGLOADCTL			BIT(0)
+
+#define LOAD_REG			(DIS_AUTOLOAD_REG | REGLOADCTL)
+
+#define SUN7I_DEBE_ATTCTL_REG0_LAY2	0x898
+#define LAY_GLBALPHA(x)			(x << 24)
+#define MAX_ALPHA			255
+#define MIN_ALPHA			0
+#define LAY_PRISEL(x)			(x << 10)
+#define DEF_VID_LAY_PRI			2 //Assuming layer 0/1 are at pri 0/1
+#define LAY_VDOEN(x)			(x << 1)
+#define EN_VID_CHAN			0x1
+
+#define SUN7I_DEBE_ATTCTL_REG1_LAY2	0x8a8
+#define LAY_FMT(x)			(x << 8)
+#define LAY_FMT_ARGB_8888 		0xa //color 32-bpp (Alpha:8/R:8/G:8/B:8)
+
+#define SUN7I_DEBE_LAY2			0x8a8
+#endif /* HACK_BACKEND_LAYER2_TO_FRONTEND */
+
 #define PRINT_DE_FE(fmt, args...)	((sunxi_de_fe_debug_lvl) == 0 ? 0 : \
     (printk( fmt, ## args)))
 

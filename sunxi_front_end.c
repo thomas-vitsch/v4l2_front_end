@@ -88,6 +88,47 @@ static struct sunxi_de_fe_fmt formats[] = {
 	},
 };
 
+#ifdef HACK_BACKEND_LAYER2_TO_FRONTEND
+static void hack_enable_be0_layer2_to_fe(uint16_t width, uint16_t height) {
+	void __iomem *io;
+	uint32_t val, base;
+
+	base = SUN7I_DEBE_BASE;
+
+	io = ioremap(SUN7I_DEBE_BASE, SUN7I_DEBE_SIZE);
+
+	val = readl(io + SUN7I_DEBE_MODCTL_REG);
+	writel(val | ENABLE_LAY2, io + SUN7I_DEBE_MODCTL_REG);
+
+	writel(LAYSIZE_HEIGHT(height) | LAYSIZE_WIDTH(width),
+	    io + SUN7I_DEBE_LAYSIZE_REG_LAY2);
+
+	writel(LAY_COOR_Y(0) | LAY_COOR_X(0), io + SUN7I_DEBE_LAYCOOR_LAY2);
+
+	writel(LAY_GLBALPHA(MAX_ALPHA) | LAY_PRISEL(DEF_VID_LAY_PRI) |
+	    LAY_VDOEN(EN_VID_CHAN), io + SUN7I_DEBE_ATTCTL_REG0_LAY2);
+
+	writel(LAY_FMT(LAY_FMT_ARGB_8888), io + SUN7I_DEBE_ATTCTL_REG1_LAY2);
+
+	writel(LOAD_REG, io + SUN7I_DEBE_REGBUFFCTL);
+}
+
+static void hack_disable_be0_layer2_to_fe(void) {
+	void __iomem *io;
+	uint32_t val;
+
+	io = ioremap(SUN7I_DEBE_BASE, SUN7I_DEBE_SIZE);
+
+	//It is enough just to disable layer2
+	val = readl(io + SUN7I_DEBE_MODCTL_REG);
+	writel(val & ~(ENABLE_LAY2), io + SUN7I_DEBE_MODCTL_REG);
+
+	writel(0x0, io + SUN7I_DEBE_ATTCTL_REG0_LAY2);
+
+	writel(LOAD_REG, io + SUN7I_DEBE_REGBUFFCTL);
+}
+#endif
+
 static struct sunxi_de_fe_fmt *find_format(struct v4l2_format *f)
 {
 	struct sunxi_de_fe_fmt *fmt;
@@ -153,6 +194,10 @@ static int vidioc_s_fmt(struct sunxi_de_fe_ctx *ctx, struct v4l2_format *f)
 
 	printk("Frontend output format is %dx%d.\n", pix_fmt_mp->width,
 	    pix_fmt_mp->height);
+
+#ifdef HACK_BACKEND_LAYER2_TO_FRONTEND
+	hack_enable_be0_layer2_to_fe(pix_fmt_mp->width, pix_fmt_mp->height);
+#endif
 
 	return 0;
 }
@@ -329,7 +374,6 @@ static int vidioc_try_fmt_vid_out(struct file *file, void *priv,
     struct v4l2_format *f)
 {
 	struct sunxi_de_fe_fmt *fmt;
-	struct sunxi_de_fe_ctx *ctx = file2ctx(file);
 
 	PRINT_DE_FE("de_fe %s();\n", __FUNCTION__);
 	fmt = find_format(f);
@@ -411,7 +455,7 @@ static void device_run(void *priv)
 	    DEFE_REG_RDY_MASK | DEFE_FRM_START_START_MASK,
 	    DEFE_REG_RDY_EN(ENABLE) | DEFE_FRM_START_BIT(ENABLE))) {
 		printk("Could not start frontend.\n");
-		return -1;
+		return;
 	}
 
 	curr_ctx = v4l2_m2m_get_curr_priv(ctx->dev->m2m_dev);
@@ -502,7 +546,7 @@ static struct video_device sunxi_de_fe_viddev = {
 	.release	= video_device_release_empty,
 };
 
-static sfe_ioctl_set_input(unsigned long arg)
+static int sfe_ioctl_set_input(unsigned long arg)
 {
 	struct sfe_input_buffers input_buffers;
 	uint32_t i;
@@ -787,11 +831,12 @@ static void sunxi_de_fe_stop_streaming(struct vb2_queue *q)
 {
 	struct sunxi_de_fe_ctx *ctx = vb2_get_drv_priv(q);
 	struct vb2_v4l2_buffer *vbuf;
-	unsigned long flags;
 
 	ctx = vb2_get_drv_priv(q);
 	PRINT_DE_FE("de_fe %s();\n", __FUNCTION__);
-
+#ifdef HACK_BACKEND_LAYER2_TO_FRONTEND
+	hack_disable_be0_layer2_to_fe();
+#endif
 	while (1) {
 		if (V4L2_TYPE_IS_OUTPUT(q->type))
 			vbuf = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
@@ -803,6 +848,7 @@ static void sunxi_de_fe_stop_streaming(struct vb2_queue *q)
 		v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_ERROR);
 		// spin_unlock_irqrestore(&ctx->dev->irqlock, flags);
 	}
+
 }
 
 static void sunxi_de_fe_buf_queue(struct vb2_buffer *vb)
@@ -871,15 +917,15 @@ static int sunxi_fe_open(struct file *file)
 	struct sunxi_fe_device *dev;
 	struct sunxi_de_fe_ctx *ctx = NULL;
 	struct v4l2_ctrl_handler *hdl;
-	uint32_t i, max_buffer_size;
-	int rc = 0;
+	uint32_t i;
+	int ret = 0;
 
 	dev = video_drvdata(file);
 	PRINT_DE_FE("de_fe %s();\n", __FUNCTION__);
 
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
 	if (!ctx) {
-		rc = -ENOMEM;
+		ret = -ENOMEM;
 		goto open_unlock;
 	}
 
@@ -890,7 +936,7 @@ static int sunxi_fe_open(struct file *file)
 	v4l2_ctrl_handler_init(hdl, 1);
 
 	if (hdl->error) {
-		rc = hdl->error;
+		ret = hdl->error;
 		v4l2_ctrl_handler_free(hdl);
 		goto open_unlock;
 	}
@@ -900,7 +946,7 @@ static int sunxi_fe_open(struct file *file)
 	ctx->fh.m2m_ctx = v4l2_m2m_ctx_init(dev->m2m_dev, ctx, &queue_init);
 
 	if (IS_ERR(ctx->fh.m2m_ctx)) {
-		rc = PTR_ERR(ctx->fh.m2m_ctx);
+		ret = PTR_ERR(ctx->fh.m2m_ctx);
 
 		v4l2_ctrl_handler_free(hdl);
 		kfree(ctx);
@@ -926,13 +972,13 @@ static int sunxi_fe_open(struct file *file)
 		printk("Could not mark coef regs rdy.\n");
 		return -1;
 	}
-	
+
 	PRINT_DE_FE("Opened de fe device\n");
 	return 0;
 
 open_unlock:
 	// mutex_unlock(&dev->dev_mutex);
-	return rc;
+	return ret;
 }
 
 static int sunxi_fe_release(struct file *file)
@@ -978,7 +1024,7 @@ static int sunxi_fe_regmap_init(struct sunxi_fe_device *sunxi_fe_dev,
 	void __iomem *regs;
 
 	PRINT_DE_FE("de_fe %s();\n", __FUNCTION__);
-	
+
 	// Appears this result cannot be checked :(
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	regs = devm_ioremap_resource(sunxi_fe_dev->dev, res);
@@ -1004,7 +1050,7 @@ static int sunxi_fe_probe(struct platform_device *pdev)
 	struct video_device *vfd;
 	int ret;
 
-	printk("/n/n/n/n/sunxi front end probe/n/n/n/n/n/n");
+	printk("sunxi front end probe");
 
 	sunxi_fe_dev = devm_kzalloc(&pdev->dev, sizeof(*sunxi_fe_dev),
 	    GFP_KERNEL);
