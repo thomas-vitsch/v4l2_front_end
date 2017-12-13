@@ -198,22 +198,5 @@
 #define DEFE_CSC_COEF_MAG(x)		((x) < 0 ? ((x) + 0x2000) : (x))
 #define DEFE_CSC_COEF_CONST(x)		((x) < 0 ? ((x) + 0x4000) : (x))
 
-/*
- * These are the offsets for the horizontal and vertical coefficients.
- * These are taken from u-boot settings.
- */
-#define DEFE_CH0_HORZCOEF0	0x400
-#define DEFE_CH0_HORZCOEF1	0x480
-#define DEFE_CH0_VERTCOEF	0x500
-#define DEFE_CH1_HORZCOEF0	0x400
-#define DEFE_CH1_HORZCOEF1	0x480
-#define DEFE_CH1_VERTCOEF	0x500
-
-
-
-
-
-
-
 #endif /* SUNXI_FRONT_END_REGISTERS_H */
 
